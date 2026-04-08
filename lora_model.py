@@ -1,182 +1,119 @@
-from tqdm import tqdm
+# -*- coding: utf-8 -*-
+
 import torch
+import pickle
+from tqdm import tqdm
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+from dataloader import create_tofu_dataloaders
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+BASE_MODEL_NAME = "allenai/OLMo-2-0425-1B-Instruct"
+LORA_ADAPTER_PATH = "./tofu_memorized_final"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+set_seed(42)
+
+# ==========================================================
+# BUILD MODEL
+# ==========================================================
+def build_lora_model():
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_NAME,
+        torch_dtype=dtype,
+        device_map="auto"
+    )
+
+    model = PeftModel.from_pretrained(base_model, LORA_ADAPTER_PATH)
+    model.train()
+
+    lora_layers = []
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            param.requires_grad = True
+            lora_layers.append(name)
+        else:
+            param.requires_grad = False
+
+    return model, tokenizer, lora_layers
 
 
-class LORAEngineTOFU(object):
+# ==========================================================
+# STREAMING GRADIENT EXTRACTION
+# ==========================================================
+def compute_sample_gradients_streaming(model, tokenizer, dataloader, lora_layers, save_path):
 
-    def __init__(
-        self,
-        base_model_name_or_path="allenai/OLMo-2-0425-1B-Instruct",
-        lora_adapter_path="./tofu_checkpoints",
-        device="cuda",
-        torch_dtype=None,
-    ):
-        self.base_model_name_or_path = base_model_name_or_path
-        self.lora_adapter_path = lora_adapter_path
-        self.device = device
-        self.torch_dtype = torch_dtype
-        self.model = None
-        self.tokenizer = None
+    # Clear file if exists
+    open(save_path, "wb").close()
 
-    # --------------------------------------------------
-    # Build Model
-    # --------------------------------------------------
-    def build_LORA_model(self):
+    for idx, batch in enumerate(tqdm(dataloader, desc=f"Streaming to {save_path}")):
 
-        if self.torch_dtype is None:
-            self.torch_dtype = (
-                torch.bfloat16
-                if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-                else torch.float16
-            )
+        batch = {k: v.to(DEVICE) for k, v in batch.items()}
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.base_model_name_or_path, trust_remote_code=True
-        )
+        if "labels" not in batch:
+            batch["labels"] = batch["input_ids"].clone()
 
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        batch["labels"][batch["labels"] == tokenizer.pad_token_id] = -100
 
-        base_model = AutoModelForCausalLM.from_pretrained(
-            self.base_model_name_or_path,
-            trust_remote_code=True,
-            torch_dtype=self.torch_dtype,
-            device_map=None,
-        )
+        model.zero_grad(set_to_none=True)
 
-        self.model = PeftModel.from_pretrained(base_model, self.lora_adapter_path)
+        outputs = model(**batch)
+        loss = outputs.loss
+        loss.backward()
 
-        # Freeze base model, enable LoRA grads only
-        self.model.train()
-        for name, param in self.model.named_parameters():
-            if "lora_" in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+        sample_grads = {}
 
-        self.model.to(self.device)
-        print("Model loaded. Trainable LoRA params enabled.")
+        for name, param in model.named_parameters():
+            if name in lora_layers and param.grad is not None:
+                sample_grads[name] = (
+                    param.grad.detach()
+                    .cpu()
+                    .float()
+                    .reshape(-1)
+                )
 
-    # --------------------------------------------------
-    # Per-Sample Gradient Computation (FULL DATASET)
-    # --------------------------------------------------
-    def compute_gradient(
-        self,
-        train_loader,
-        forget_loader,
-        max_train_samples=None,
-        max_val_samples=None,
-        print_every=50,
-    ):
+        # STREAM WRITE — no dictionary accumulation
+        with open(save_path, "ab") as f:
+            pickle.dump((idx, sample_grads), f)
 
-        assert self.model is not None, "Call build_LORA_model() first."
+        # Free everything
+        del outputs, loss, sample_grads
+        torch.cuda.empty_cache()
 
-        trainable_param_names = set(
-            n for n, p in self.model.named_parameters() if p.requires_grad
-        )
-
-        def extract(loader, limit, desc):
-
-            grad_dict_out = {}
-            sample_idx = 0
-
-            for step, batch in enumerate(tqdm(loader, desc=desc)):
-
-                if limit and sample_idx >= limit:
-                    break
-
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                B = batch["input_ids"].shape[0]
-
-                if "labels" not in batch:
-                    batch["labels"] = batch["input_ids"].clone()
-
-                batch["labels"][batch["labels"] == self.tokenizer.pad_token_id] = -100
-
-                # ---- PER SAMPLE LOOP ----
-                for i in range(B):
-
-                    if limit and sample_idx >= limit:
-                        break
-
-                    single_batch = {k: v[i].unsqueeze(0) for k, v in batch.items()}
-
-                    self.model.zero_grad(set_to_none=True)
-                    loss = self.model(**single_batch).loss
-                    loss.backward()
-
-                    grads = {}
-                    total_norm = 0.0
-
-                    for n, p in self.model.named_parameters():
-                        if n in trainable_param_names and p.grad is not None:
-                            g = p.grad.detach().cpu().clone()
-                            grads[n] = g
-                            total_norm += g.norm().item()
-
-                    grad_dict_out[sample_idx] = grads
-
-                    if sample_idx % print_every == 0:
-                        print(f"\nSample {sample_idx}")
-                        print(f"Loss: {loss.item():.4f}")
-                        print(f"Total grad norm: {total_norm:.6f}")
-
-                    sample_idx += 1
-
-            return grad_dict_out
-
-        tr_grad_dict = extract(
-            train_loader, max_train_samples, "Training Gradients (Per-Sample)"
-        )
-        val_grad_dict = extract(
-            forget_loader, max_val_samples, "Forget Set Gradients (Per-Sample)"
-        )
-
-        print("\nGradient Extraction Complete")
-        print(f"Train samples processed: {len(tr_grad_dict)}")
-        print(f"Forget samples processed: {len(val_grad_dict)}")
-
-        return tr_grad_dict, val_grad_dict
+    print(f"Finished streaming gradients to {save_path}")
 
 
-# --------------------------------------------------
+# ==========================================================
 # MAIN
-# --------------------------------------------------
-
+# ==========================================================
 if __name__ == "__main__":
 
-    print("Starting LORA Engine (FULL DATASET)...")
-
-    engine = LORAEngineTOFU(
-        base_model_name_or_path="allenai/OLMo-2-0425-1B-Instruct",
-        lora_adapter_path="./tofu_checkpoints",
-        device="cuda"
-    )
-
-    engine.build_LORA_model()
-
-    from dataloader import create_tofu_dataloaders
+    model, tokenizer, lora_layers = build_lora_model()
 
     train_loader, forget_loader, _, _ = create_tofu_dataloaders(
-        model_name_or_path="allenai/OLMo-2-0425-1B-Instruct",
-        batch_size=4
+        BASE_MODEL_NAME,
+        batch_size=1
     )
 
-    # Confirm full dataset sizes
-    print("Train dataset size:", len(train_loader.dataset))
-    print("Forget dataset size:", len(forget_loader.dataset))
-
-    # FULL DATASET (no limits)
-    tr_grad_dict, val_grad_dict = engine.compute_gradient(
+    compute_sample_gradients_streaming(
+        model,
+        tokenizer,
         train_loader,
-        forget_loader,
-        max_train_samples=None,
-        max_val_samples=None,
-        print_every=50
+        lora_layers,
+        "tr_grads.pkl"
     )
 
-    print("\nDone extracting gradients.")
-    print("Train samples:", len(tr_grad_dict))
-    print("Forget samples:", len(val_grad_dict))
+    compute_sample_gradients_streaming(
+        model,
+        tokenizer,
+        forget_loader,
+        lora_layers,
+        "forget_grads.pkl"
+    )
